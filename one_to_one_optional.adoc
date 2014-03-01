@@ -1,0 +1,160 @@
+
+= Proxies and lazy loading in Hibernate
+
+This page is a summary of what I have read and (mis)understood about an hot topic like lazy loading in case of a +@OneToOne+ association. My intent is to help others developers who are startled of how Hibernate implements lazy loading, and above all to verify my understanding of these topics.
+
+First of all, some definitions and facts that are necessary to undestand the rest of the page.
+
+== What is a proxy
+
+As far as I know, Hibernate creates a proxy class for each entity. A proxy is just a *runtime* generated class that extends the entity and enriches its behavior with features like lazy-loading. The ability of creating classes at runtime is provided by libraries like http://www.csg.ci.i.u-tokyo.ac.jp/~chiba/javassist/[javassist] and http://cglib.sourceforge.net/[cglib].
+
+The proxy ia almost transparent to the developer, because things like 
+
+[source,java]
+----
+if (user instanceof User) {
+	...
+}
+----
+
+continues to work also if +User+ is a proxy generated class instead of a real +User+ class.
+
+WARNING: actually it's better if you are aware of the http://java-success.blogspot.it/2012/09/understanding-hibernate-proxy-objects.html[potential pitfalls] related to proxies.
+
+== When Hibernate uses proxy
+
+This is far from my understanding, nontheless I know that sometimes Hibernate returns a proxy and sometimes not. One well known situation where Hibernate *doesn't* return a proxy is the following:
+
+[source,java]
+----
+User user = em.find(User.class, id);
+----
+
++user+ is an instance of your class and not a proxy (at least this is true if that user isn't already in the _persistence context_). You can easily check this fact just printing the class name.
+
+== How Hibernate implements lazy loading
+
+Lazy loading optimizes the way Hibernate hits the database. Anyway I won't discuss here the imporance of such feature. Instead I would like to describe how it's implemented. 
+
+=== One-to-many: the simple case
+
+One quite simple and easy to understand situation, is when you deal with +@OneToMany+ mappings:
+
+[source,java]
+----
+@Entity
+public class User implements Serializable {
+	
+	...
+
+	@OneToMany(mappedBy="user", fetch=Lazy)
+	private List<Address> addressList;
+
+	...
+}
+
+...
+
+//returns a user without hitting ADDRESS table
+User user = em.find(User.class, 1001);
+
+ //load address list hitting the db
+user.getAddressList().get(0);
+----
+
+If you remember, +em.find+ returns a real +User+ entity and not a proxy. It doesn't need to return a proxy or perform whatever magic. 
+
+Hibernate just set a special list implementation in +addressList+ property, before returning the object. This special list implementation performs a query, effectively loading the list at the first access (methods like +size()+, +get(index)+, etc).
+
+
+=== One-to-one mapping
+
+
+One-to-one mapping is a little more complicated. Now a user ownes only one address:
+
+[source,java]
+----
+@Entity
+public class User user implements Serializable {
+	...
+	@OneToOne(fetch=EAGER)
+	private Address address;
+	...
+}
+
+...
+User user = em.find(User.class, 1001);
+
+----
+
+Because of eager fetching, Hibernate can just performs a query with a join between +USER+ and +ADDRESS+. In this way Hibernate can eagerly load a user and its address in a single hit.
+
+But, if we want to lazily fech the address, things are different:
+
+[source,java]
+----
+@Entity
+public class User user implements Serializable {
+	...
+	@OneToOne(fetch=LAZY)
+	private Address address;
+	...
+}
+----
+
+Here Hibernate continues to use the technique described in +@OneToMany+ section, but now it needs to set a proxy of +Address+ instead of a special list. Again, when you access the address object, Hibernate hits the database.As usual, keep in mind that in 
+
+[source,java]
+----
+User user = em.find(User.class, 1001);
+----
+
++user+ is not a proxy. Instead, the address of the user is a proxy object.
+
+
+=== One-to-one and optional
+
++optional+ means that a relation must exist or not. For example, if a user-addresss relation is annotated as optional, the user could not have an address. If the relation is not optional user must have an address.
+
+[source,java]
+----
+@OneToOne(fetch=LAZY, optional=true)
+private Address address;
+----
+
+*Quite surprisingly, the +optional+ attribute affects the laziness of the association*. What is bad is that it happens not by design, but because of how Hibrenate is implemented. The tons of pages you can find in the web trying to explain exactly this combination of attributes, witness this fact.
+
+The problem is that if Hibernate creates a proxy to lazy load address and if an address doesn't exist, it would be in trouble. A proxy can't in any way evaluate to null. In other words, checks on nullability wouldn't work:
+
+[source,java]
+----
+User user = em.find(User.class, 1001);
+if (user.getAddress() == null) {
+ 	...
+}
+---- 
+
+Address can't be +null+, because it's a proxy. 
+
+So a one-to-one optional association can't be lazy.
+
+NOTE: actually this limitation should apply only to one-to-one associations implemented through primary key. If a foreign key is used, then Hibernate has the chance to check if the column +ADDRESS_FK+ is null or not. If null, it sets the property to null, otherwise creates the proxy.
+
+*At this point I have a question for Hibernate experts*: _why Hibernate doesn't return always a proxy? Given this, user is a proxy, and as a proxy +getAddress()+ could be enriched with some lazy-loading logic: if the address is not found return null, otherwise return an address (I am sure there is a good reason, or just that it's hard to implement and no one has already written a patch)_.
+
+
+*This limitation can be overtaken by byte code enhancer*. This means that if you add an http://docs.jboss.org/hibernate/orm/3.6/reference/en-US/html/performance.html[Ant task] or a Maven plugin to your build process, you can get lazy-loaded optional one-to-one associations. Byte code enhancer just rewrites the byte code (.class) at build time. To leverage this possibility, your entity should be annotated like so:
+
+[source,java]
+----
+@OneToOne(fetch=LAZY, optional=true)
+@LazyToOne(LazyToOneOption.NO_PROXY)
+private Address address;
+----
+
+== Conclusion
+
+The problem with lazy-loading an optional one-to-one association can be definitely solved through byte code enhancement. Still, if you don't want to introduce plugins in the build process or you think it can be cause of further problems, you have to understand when (and probably why) lazy loading is possible in a one-to-one relationship.
+
+Any feedback, correction (even about english) and suggestion is highly appreciated!
